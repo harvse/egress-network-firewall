@@ -12,10 +12,12 @@ interface NetworkStackProps extends cdk.StackProps {
     /**
      * Mapping between VPC CIDR ranges and FQDNs to allowlist.
      */
-    readonly cidrFqdns: { [name: string]: { cidrs: string[]; fqdns: string[] } };
+    readonly allowList: { cidrs: string[]; fqdns: string[] }[];
 }
 
 export class NetworkStack extends cdk.Stack {
+    private readonly MAX_RULES_LENGTH = 2000000;
+
     private _transitGateway;
 
     constructor(scope: Construct, id: string, props: NetworkStackProps) {
@@ -65,32 +67,46 @@ export class NetworkStack extends cdk.Stack {
             vpcId: vpc.vpcId,
         });
 
-        // Define stateful rules for each mapping of CIDRs and FQDNs to allowlist
-        const statefulRules = Object.entries(props.cidrFqdns).map(
-            ([ruleName, { cidrs, fqdns }]) =>
-                new cdk.aws_networkfirewall.CfnRuleGroup(this, `${ruleName}AllowList`, {
-                    capacity: 30000 / 20,
-                    ruleGroupName: `${ruleName}AllowList`,
-                    type: 'STATEFUL',
-                    ruleGroup: {
-                        ruleVariables: { ipSets: { HOME_NET: { definition: cidrs } } },
-                        rulesSource: {
-                            rulesSourceList: {
-                                generatedRulesType: 'ALLOWLIST',
-                                targets: fqdns,
-                                targetTypes: ['HTTP_HOST', 'TLS_SNI'],
-                            },
-                        },
-                    },
-                }),
+        // Define the HOME_NET to comprise all allowlisted CIDRs.
+        const homeNet = [...new Set(props.allowList.flatMap(({ cidrs }) => cidrs))];
+
+        // Define stateful rules for each FQDN with the CIDRs to be allowlisted
+        let sidCount = 1;
+        const rules = props.allowList.flatMap(({ cidrs, fqdns }) =>
+            fqdns.flatMap((fqdn) => [
+                `pass http [${cidrs.join(',')}] any -> $EXTERNAL_NET any (http.host;${fqdn.startsWith('.') ? ' dotprefix; ' : ' '}content:"${fqdn}"; endswith; flow:to_server, established; sid:${sidCount++}; rev:1;)`,
+                `pass tls [${cidrs.join(',')}] any -> $EXTERNAL_NET any (ssl_state:client_hello; tls.sni;${fqdn.startsWith('.') ? ' dotprefix; ' : ' '}content:"${fqdn}"; nocase; endswith; flow:to_server, established; sid:${sidCount++}; rev:1;)`,
+            ]),
         );
+
+        // Pack the rules into as few groups as possible
+        const ruleGroups = this.binpackRules(rules);
+
+        // Create stateful rule groups for each group of rules
+        const statefulRuleGroups = ruleGroups.map((ruleGroup) => {
+            const hash = this.generateRulesHash(ruleGroup);
+            const ruleGroupName = `AllowList-${hash}`;
+            return new cdk.aws_networkfirewall.CfnRuleGroup(this, ruleGroupName, {
+                capacity: ruleGroup.length,
+                ruleGroupName,
+                type: 'STATEFUL',
+                ruleGroup: {
+                    ruleVariables: { ipSets: { HOME_NET: { definition: homeNet } } },
+                    rulesSource: { rulesString: ruleGroup.join('\n') },
+                    statefulRuleOptions: { ruleOrder: 'STRICT_ORDER' },
+                },
+            });
+        });
 
         // Define a firewall policy
         const firewallPolicy = new cdk.aws_networkfirewall.CfnFirewallPolicy(this, 'FirewallPolicy', {
             firewallPolicy: {
-                statefulRuleGroupReferences: statefulRules.map(({ attrRuleGroupArn }) => ({
+                statefulRuleGroupReferences: statefulRuleGroups.map(({ attrRuleGroupArn }, i) => ({
+                    priority: i + 1,
                     resourceArn: attrRuleGroupArn,
                 })),
+                statefulDefaultActions: ['aws:drop_established'],
+                statefulEngineOptions: { ruleOrder: 'STRICT_ORDER' },
                 statelessDefaultActions: ['aws:forward_to_sfe'],
                 statelessFragmentDefaultActions: ['aws:forward_to_sfe'],
             },
@@ -200,14 +216,11 @@ export class NetworkStack extends cdk.Stack {
 
         // Inbound traffic routing
 
-        // Collect the CIDRs that we allowed outbound traffic for
-        const cidrs = Object.values(props.cidrFqdns).flatMap(({ cidrs }) => cidrs);
-
         // Create routes from the NAT gateway subnets to the firewall endpoints
         vpc.selectSubnets({ subnetGroupName: 'nat' }).subnets.forEach(({ availabilityZone, routeTable }, i) =>
-            cidrs.forEach(
-                (destinationCidrBlock) =>
-                    new cdk.aws_ec2.CfnRoute(this, `GatewayToFirewall_${i + 1}`, {
+            homeNet.forEach(
+                (destinationCidrBlock, j) =>
+                    new cdk.aws_ec2.CfnRoute(this, `GatewayToFirewall_${i + 1}_${j + 1}`, {
                         destinationCidrBlock,
                         routeTableId: routeTable.routeTableId,
                         vpcEndpointId: firewallEndpointIds[availabilityZone] ?? Object.values(firewallEndpointIds)[0],
@@ -217,14 +230,44 @@ export class NetworkStack extends cdk.Stack {
 
         // Create routes from the firewall endpoint subnets to the transit gateway - depend on the attachment
         vpc.selectSubnets({ subnetGroupName: 'firewall' }).subnets.forEach(({ routeTable }, i) =>
-            cidrs.forEach((destinationCidrBlock) =>
-                new cdk.aws_ec2.CfnRoute(this, `FirewallToTransit_${i + 1}`, {
+            homeNet.forEach((destinationCidrBlock, j) =>
+                new cdk.aws_ec2.CfnRoute(this, `FirewallToTransit_${i + 1}_${j + 1}`, {
                     destinationCidrBlock,
                     routeTableId: routeTable.routeTableId,
                     transitGatewayId: this._transitGateway.attrId,
                 }).node.addDependency(attachment),
             ),
         );
+    }
+
+    /**
+     * Packs together rules as tightly as possible while respecting quotas.
+     */
+    private binpackRules(rules: string[]) {
+        rules.sort((a, b) => b.length - a.length);
+        const bins: string[][] = [[]];
+        let currentSize = 0;
+        let currentIndex = 0;
+        for (const rule of rules) {
+            if (rule.length + currentSize < this.MAX_RULES_LENGTH) {
+                currentSize += rule.length;
+            } else {
+                currentIndex += 1;
+                currentSize = rule.length;
+            }
+            bins[currentIndex].push(rule);
+        }
+        return bins;
+    }
+
+    /**
+     * Generates a unique hash from all the rules in the group.
+     */
+    private generateRulesHash(rules: string[]) {
+        return rules
+            .join('')
+            .split('')
+            .reduce((prevHash, currVal) => ((prevHash << 5) - prevHash + currVal.charCodeAt(0)) | 0, 0);
     }
 
     /**

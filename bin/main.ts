@@ -14,8 +14,8 @@ const env = {
 const workloadCidr = '10.1.0.0/16';
 
 const networkStack = new NetworkStack(app, 'NetworkStack', {
-    cidrFqdns: {
-        workload: {
+    allowList: [
+        {
             cidrs: [workloadCidr],
             fqdns: [
                 'google.com',
@@ -24,7 +24,7 @@ const networkStack = new NetworkStack(app, 'NetworkStack', {
                 'ssmmessages.ap-southeast-2.amazonaws.com',
             ],
         },
-    },
+    ],
     env,
 });
 
